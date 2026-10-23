@@ -10,12 +10,43 @@
 <div class="col-md-8 mx-auto mb-4">
   <div class="card shadow-sm">
     <div class="card-body">
-      <h5 class="card-title">Create a new post</h5>
+      <h5 class="card-title">
+        {% if pending_post %}
+          Edit or Confirm Your Post
+        {% else %}
+          Create a new post
+        {% endif %}
+      </h5>
       <form action="{{ url_for('add_post') }}" method="POST">
         <div class="mb-3">
-          <textarea class="form-control" name="content" rows="3" placeholder="What's on your mind, {{ session.get('username') }}?" required></textarea>
+          <textarea class="form-control {% if pending_post %}border-warning{% endif %}" name="content" rows="3" placeholder="What's on your mind, {{ session.get('username') }}?" required>{{ pending_post.content if pending_post else '' }}</textarea>
         </div>
-        <button type="submit" class="btn btn-primary float-end">Post</button>
+
+        {% if pending_post %}
+          <div class="alert alert-warning border-warning shadow-sm my-3" role="alert">
+            <h6 class="alert-heading fw-bold mb-1">Community Guidelines Reminder</h6>
+            {% if pending_post.is_severe %}
+              <p class="mb-1 text-danger fw-semibold">This post cannot be published as is because it contains severe rule violations.</p>
+              <p class="mb-0">Please remove the violating content above and click <em>Update & Post</em> to continue.</p>
+            {% else %}
+              <p class="mb-2">Your post contains content that violates community norms (e.g., profanity, external links, or excessive capitals).<br>If published, it will be moderated as follows:</p>
+              <div class="p-2 mb-2 bg-light border rounded text-dark">
+                <strong>Preview:</strong> <code style="white-space: pre-wrap;">{{ pending_post.moderated_content }}</code>
+              </div>
+              <p class="mb-0 text-muted">You can edit the text above to fix it or confirm below to publish the moderated version.</p>
+            {% endif %}
+          </div>
+
+          <div class="d-flex justify-content-end align-items-center gap-2">
+            <a href="{{ url_for('feed') }}" class="btn btn-primary">Cancel</a>
+            <button type="submit" class="btn btn-primary">Update & Post</button>
+            {% if not pending_post.is_severe %}
+              <button type="submit" name="confirmed" value="1" class="btn btn-warning">Confirm & Post Anyway</button>
+            {% endif %}
+          </div>
+        {% else %}
+          <button type="submit" class="btn btn-primary float-end">Post</button>
+        {% endif %}
       </form>
     </div>
   </div>

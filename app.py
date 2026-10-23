@@ -194,6 +194,7 @@ def feed():
         })
 
     #  4. Render Template with Pagination Info 
+    pending_post = session.pop('pending_post', None)
     return render_template('feed.html.j2', 
                            posts=posts_data, 
                            current_sort=sort,
@@ -201,11 +202,17 @@ def feed():
                            page=page, # Pass current page number
                            per_page=POSTS_PER_PAGE, # Pass items per page
                            reaction_emojis=REACTION_EMOJIS,
-                           reaction_types=REACTION_TYPES)
+                           reaction_types=REACTION_TYPES,
+                           pending_post=pending_post # Export the pending post to the feed template for Design Claim 20
+                                        )
 
 @app.route('/posts/new', methods=['POST'])
 def add_post():
-    """Handles creating a new post from the feed."""
+    """
+    Handles creating a new post from the feed.
+    Implements Design Claim 20 (Offering people reminders at the point of an action that may violate
+    norms reduces the number of offenses.)
+    """
     user_id = session.get('user_id')
 
     # Block access if user is not logged in
@@ -214,23 +221,52 @@ def add_post():
         return redirect(url_for('login'))
 
     # Get content from the submitted form
-    content = request.form.get('content')
+    raw_content = request.form.get('content', '')
+    content = raw_content.strip()
+    confirmed = request.form.get('confirmed') == '1'
 
-    # Pass the user's content through the moderation function
-    moderated_content = content
+    if not content:
+        flash('Post cannot be empty.', 'warning')
+        return redirect(url_for('feed'))
 
-    # Basic validation to ensure post is not empty
-    if moderated_content and moderated_content.strip():
-        db = get_db()
-        db.execute('INSERT INTO posts (user_id, content) VALUES (?, ?)',
-                   (user_id, moderated_content))
-        db.commit()
-        flash('Your post was successfully created!', 'success')
+    # Evaluate content moderation
+    moderated_content, score = moderate_content(content)
+    is_severe = moderated_content.startswith('[content removed') # Capture Tier 1 and Tier 2 moderation
+
+    # Severe violations cannot be published even with confirmation
+    if is_severe:
+        session['pending_post'] = {
+            'content': content,
+            'moderated_content': moderated_content,
+            'score': score,
+            'is_severe': True
+        }
+        return redirect(url_for('feed'))
+
+    # Design Claim 20: Offering people reminders at the point of an action that may violate
+    # norms reduces the number of offenses.
+    # If the post violates norms (score > 0) and has not been explicitly confirmed:
+    if score > 0 and not confirmed:
+        session['pending_post'] = {
+            'content': content,
+            'moderated_content': moderated_content,
+            'score': score,
+            'is_severe': is_severe
+        }
+        return redirect(url_for('feed'))
+
+    # Save post: use censored text if confirmed with mild violations, or raw text if clean
+    final_content = moderated_content if confirmed else content
+    db = get_db()
+    db.execute('INSERT INTO posts (user_id, content) VALUES (?, ?)',
+               (user_id, final_content))
+    db.commit()
+
+    if confirmed:
+        flash('Your post was published with community moderation applied.', 'info')
     else:
-        # This will catch empty posts or posts that were fully censored
-        flash('Post cannot be empty or was fully censored.', 'warning')
+        flash('Your post was successfully created!', 'success')
 
-    # Redirect back to the main feed to see the new post
     return redirect(url_for('feed'))
     
     
