@@ -7,6 +7,8 @@ import sqlite3
 import hashlib
 import re
 from datetime import datetime
+from urllib.parse import urlsplit
+from jinja2.utils import _http_re
 
 app = Flask(__name__)
 app.secret_key = '123456789' 
@@ -856,6 +858,92 @@ def admin_delete_comment(comment_id):
 def rules():
     return render_template('rules.html.j2')
 
+def moderate_content(content):
+    """
+    Args
+        content: the text content of a post or comment to be moderated.
+
+    Returns:
+        A tuple containing the moderated content (string) and a severity score (float). There are no strict rules or bounds to the severity score, other than that a score of less than 1.0 means no risk, 1.0 to 3.0 is low risk, 3.0 to 5.0 is medium risk, and above 5.0 is high risk.
+
+    This function moderates a string of content and calculates a severity score based on
+    rules loaded from the 'censorship.dat' file. These are already loaded as TIER1_WORDS, TIER2_PHRASES, and TIER3_WORDS. Tier 1 corresponds to strong profanity, Tier 2 to scam/spam phrases, and Tier 3 to mild profanity.
+
+    You will be able to check the scores by logging in with the administrator account:
+            username: admin
+            password: admin
+    Then, navigate to the /admin endpoint. (http://localhost:8080/admin)
+    """
+
+    # To manage edge cases
+    if not content:
+        return '', 0.0
+    content = str(content)
+
+    # Stage 1.1: Severe Violation Checks
+
+    # Rule 1.1.1 (Tier 1 Words): A case-insensitive, whole-word search is performed against the Tier 1 Word List.
+    # If a match is found, the function immediately returns the string [content removed due to severe violation] and a
+    # fixed Content Score of 5.0.
+    # Regex search for tier 1; Case-insensitive, whole-word search
+    tier1_regex = re.compile(
+        r'\b(' + '|'.join(re.escape(word) for word in TIER1_WORDS) + r')\b', # escape to prevent any potential issues
+        re.IGNORECASE)
+    tier1_matches = tier1_regex.search(content)
+    if tier1_matches:
+        moderated_content = '[content removed due to severe violation]'
+        score = 5.0
+        return moderated_content, score
+
+    # Rule 1.1.2 (Tier 2 Phrases): If no Tier 1 match is found, a case-insensitive, whole-phrase search is performed
+    # against the Tier 2 Phrase List. If a match is found, the function immediately returns the string
+    # [content removed due to spam/scam policy] and a fixed Content Score of 5.0.
+    # Regex search for tier 2; Case-insensitive, whole-phrase search
+    tier2_regex = re.compile(
+        r'\b(' + '|'.join(re.escape(phrase) for phrase in sorted(TIER2_PHRASES, key=len, reverse=True)) + r')\b',
+        re.IGNORECASE)  # escape to prevent any potential issues
+    tier2_matches = tier2_regex.search(content)
+    if tier2_matches:
+        moderated_content = '[content removed due to spam/scam policy]'
+        score = 5.0
+        return moderated_content, score
+
+    # Stage 1.2: Scored Violations & Filtering
+    score = 0
+    moderated_content = content
+
+    # Rule 1.2.1 (Tier 3 Words): Each case-insensitive, whole-word match from the Tier 3 Word List is replaced with
+    # asterisks (*) equal to its length. The Content Score is increased by +2.0 for each match.
+    tier3_regex = re.compile(
+        r'\b(?:' + '|'.join(re.escape(word) for word in sorted(TIER3_WORDS, key=len, reverse=True)) + r')\b',
+        re.IGNORECASE
+    )
+    moderated_content, t3_count = tier3_regex.subn(lambda m: '*' * len(m.group(0)), moderated_content)
+    score += t3_count * 2.0
+    # Reverse sort is used here to be able to censor the longest words first.
+
+    # Rule 1.2.2 (External Links): Each detected URL is replaced with [link removed].
+    # The Content Score is increased by +2.0 for each match.
+    url_pattern = re.compile(
+        r'https?://\S+|www\.\S+',
+        re.IGNORECASE
+    ) # From https://www.geeksforgeeks.org/python/python-check-url-string/
+    moderated_content, url_count = url_pattern.subn(
+        '[link removed]',
+        moderated_content
+    )
+    score += url_count * 2.0
+
+    # Rule 1.2.3 (Excessive Capitalization): If content has >15 alphabetic characters and >70% are uppercase,
+    # the Content Score is incremented by a fixed value of +0.5. The content is not modified.
+    if len([C for C in content if C.isalpha()]) > 15 and \
+        len([C for C in content if C.isupper()]) > len([C for C in content if C.isalpha()]) * 0.7:
+        score += 0.5
+
+    return moderated_content, score
+
+    
+# Assignment 2.1
 @app.template_global()
 def loop_color(user_id):
     # Generate a pastel color based on user_id hash
@@ -876,41 +964,62 @@ def user_risk_analysis(user_id):
         user_id: The ID of the user on which we perform risk analysis.
 
     Returns:
-        A float number score showing the risk associated with this user. There are no strict rules or bounds to this score, other than that a score of less than 1.0 means no risk, 1.0 to 3.0 is low risk, 3.0 to 5.0 is medium risk and above 5.0 is high risk. (An upper bound of 5.0 is applied to this score elsewhere in the codebase) 
-        
+        A float number score showing the risk associated with this user. There are no strict rules or bounds to this score, other than that a score of less than 1.0 means no risk, 1.0 to 3.0 is low risk, 3.0 to 5.0 is medium risk, and above 5.0 is high risk. (An upper bound of 5.0 is applied to this score elsewhere in the codebase)
+
         You will be able to check the scores by logging in with the administrator account:
             username: admin
             password: admin
         Then, navigate to the /admin endpoint. (http://localhost:8080/admin)
     """
-    
-    score = 0
+    # Step 1 (Profile Score): Calculate the Content Score of the user's profile text. This is the profile_score.
+    user_profile_text = query_db('SELECT profile FROM users WHERE id = ?', (user_id,), one=True)
+    user_profile_text = user_profile_text["profile"]
+    (_, profile_score) = moderate_content(user_profile_text)
 
-    return score;
+    # Step 2 (Post Score): Calculate the Content Score for all the user's posts and find the average.
+    # This is the average_post_score. If the user has no posts, this value is 0.
+    average_post_score = 0
+    user_posts = query_db('SELECT content FROM posts WHERE user_id = ?', (user_id,))
+    if user_posts:
+        for post in user_posts:
+            (_, post_score) = moderate_content(post["content"])
+            average_post_score += post_score
+        average_post_score /= len(user_posts)
 
-    
-# Assignment 2.1
-def moderate_content(content):
-    """
-    Args
-        content: the text content of a post or comment to be moderated.
-        
-    Returns: 
-        A tuple containing the moderated content (string) and a severity score (float). There are no strict rules or bounds to the severity score, other than that a score of less than 1.0 means no risk, 1.0 to 3.0 is low risk, 3.0 to 5.0 is medium risk and above 5.0 is high risk.
-    
-    This function moderates a string of content and calculates a severity score based on
-    rules loaded from the 'censorship.dat' file. These are already loaded as TIER1_WORDS, TIER2_PHRASES and TIER3_WORDS. Tier 1 corresponds to strong profanity, Tier 2 to scam/spam phrases and Tier 3 to mild profanity.
-    
-    You will be able to check the scores by logging in with the administrator account:
-            username: admin
-            password: admin
-    Then, navigate to the /admin endpoint. (http://localhost:8080/admin)
-    """
+    # Step 3 (Comment Score): Calculate the Content Score for all of the user's comments and find the average.
+    # This is the average_comment_score. If the user has no comments, this value is 0.
+    average_comment_score = 0
+    user_comments = query_db('SELECT content FROM comments WHERE user_id = ?', (user_id,))
+    if user_comments:
+        for comment in user_comments:
+            (_, comment_score) = moderate_content(comment["content"])
+            average_comment_score += comment_score
+        average_comment_score /= len(user_comments)
 
-    moderated_content = content
-    score = 0
-    
-    return moderated_content, score
+    # Step 4 (Combine Scores): A preliminary content_risk_score is calculated using the following formula:
+    # content_risk_score = (profile_score * 1) + (average_post_score * 3) + (average_comment_score * 1)
+    content_risk_score = (profile_score * 1) + (average_post_score * 3) + (average_comment_score * 1)
+
+    # Step 5 (Apply Age Multiplier): The final user_risk_score is determined by applying a multiplier
+    # to the content_risk_score based on account age:
+    #
+    #     If account age < 7 days: user_risk_score = content_risk_score * 1.5
+    #     If account age < 30 days: user_risk_score = content_risk_score * 1.2
+    #     Otherwise: user_risk_score = content_risk_score
+    account_age = query_db('SELECT created_at FROM users WHERE id = ?', (user_id,), one=True)
+    account_age = account_age["created_at"]
+    account_age = (datetime.utcnow() - account_age).days
+    user_risk_score = content_risk_score
+    if account_age < 7:
+        user_risk_score = content_risk_score * 1.5
+    elif account_age < 30:
+        user_risk_score = content_risk_score * 1.2
+
+    # Step 6 (Final Capping): The final calculated user_risk_score is capped at a maximum value of 5.0.
+    if user_risk_score > 5.0:
+        user_risk_score = 5.0
+
+    return user_risk_score;
 
 # Coding Assignment #3
 # Assignment 3.1
